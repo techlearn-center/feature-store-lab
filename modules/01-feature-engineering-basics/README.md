@@ -1,10 +1,10 @@
-# Module 01: Feature Engineering Basics
+# Module 01: Feature Store Fundamentals
 
 | | |
 |---|---|
 | **Time** | 3-5 hours |
 | **Difficulty** | Beginner |
-| **Prerequisites** | Docker installed, basic terminal knowledge |
+| **Prerequisites** | Docker installed, Python 3.10+, basic ML concepts |
 
 ---
 
@@ -12,38 +12,96 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of Feature Engineering Basics
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Explain why feature stores exist and what problems they solve
+- Distinguish between online and offline feature stores
+- Identify the training-serving skew problem and how feature stores prevent it
+- Describe the core components of a feature store architecture
+- Run a minimal feature engineering workflow from raw data to model-ready features
 
 ---
 
 ## Concepts
 
-### What is Feature Engineering Basics?
+### Why Do Feature Stores Exist?
 
-Feature Engineering Basics is a fundamental component of Feature Store Lab: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
+In a typical ML system without a feature store, teams face three recurring problems:
 
-**Real-world analogy:** Think of Feature Engineering Basics like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
+1. **Training-serving skew** -- The features computed during training are different from those computed during inference, causing silent model degradation.
+2. **Duplicated work** -- Every team rebuilds the same features (e.g., "user's average spend in the last 30 days") from scratch.
+3. **Inconsistent data** -- Feature logic lives in scattered notebooks, pipelines, and microservices with no single source of truth.
 
-### Why Does This Matter?
+A feature store is a centralized system that **computes, stores, and serves** ML features consistently across training and inference.
 
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+```
++-------------------+        +------------------+        +------------------+
+|   Raw Data        |  --->  |  Feature Store   |  --->  |  ML Model        |
+|  (events, logs,   |        |  - Compute       |        |  - Training      |
+|   transactions)   |        |  - Store         |        |  - Inference     |
++-------------------+        |  - Serve         |        +------------------+
+                             +------------------+
+                              |               |
+                         Offline Store   Online Store
+                         (PostgreSQL)      (Redis)
+                         Historical        Low-latency
+                         training data     serving
+```
 
-### Key Terminology
+### Online vs. Offline Stores
 
-| Term | Definition |
-|---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+| Aspect | Offline Store | Online Store |
+|---|---|---|
+| **Purpose** | Generate training datasets | Serve features at inference time |
+| **Latency** | Seconds to minutes | Sub-millisecond to milliseconds |
+| **Storage** | Data warehouse (PostgreSQL, BigQuery, Snowflake) | Key-value store (Redis, DynamoDB) |
+| **Access pattern** | Batch queries with point-in-time joins | Key-based lookups by entity ID |
+| **Data volume** | Full history (months/years) | Latest values only |
+| **Typical user** | Data scientist building training sets | ML model in production |
+
+### Core Architecture Components
+
+```
+                          +---------------------+
+                          |   Feature Registry  |
+                          |  (metadata, schemas,|
+                          |   lineage, owners)  |
+                          +----------+----------+
+                                     |
+   +------------------+    +---------+---------+    +------------------+
+   | Data Sources     |--->| Feature Pipeline  |--->| Feature Views    |
+   | (DB, streams,    |    | (compute, validate|    | (logical groups  |
+   |  files, APIs)    |    |  transform)       |    |  of features)    |
+   +------------------+    +-------------------+    +--------+---------+
+                                                             |
+                                              +--------------+--------------+
+                                              |                             |
+                                     +--------+--------+          +---------+--------+
+                                     |  Offline Store  |          |  Online Store    |
+                                     |  (historical)   |          |  (low-latency)   |
+                                     +-----------------+          +------------------+
+```
+
+**Entity** -- The primary key for feature lookups (e.g., `customer_id`, `driver_id`).
+
+**Feature View** -- A named group of related features from a single data source with a defined schema.
+
+**Feature Service** -- A bundle of feature views consumed by a specific ML model.
+
+**Materialization** -- The process of computing features and pushing them from the offline store into the online store.
+
+### The Training-Serving Skew Problem
+
+Consider a fraud detection model. During training, a data scientist computes `avg_transaction_amount_30d` in a Jupyter notebook using pandas. During inference, a backend engineer recomputes it using a SQL query. Subtle differences (timezone handling, null treatment, window boundaries) cause the model to see different feature values than it was trained on.
+
+```python
+# Training (notebook) - uses pandas, inclusive window
+avg_30d = df[df['date'] >= cutoff].groupby('user_id')['amount'].mean()
+
+# Serving (API) - uses SQL, different boundary logic
+# SELECT AVG(amount) FROM transactions WHERE date > cutoff GROUP BY user_id
+#                                                     ^^ exclusive vs inclusive
+```
+
+A feature store eliminates this by computing features **once** and serving the same values to both training and inference.
 
 ---
 
@@ -51,77 +109,179 @@ Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
 
 ### Prerequisites Check
 
-Before starting, verify your environment:
-
 ```bash
-# Check Docker is running
+# Verify Python
+python --version  # 3.10+
+
+# Verify Docker
 docker --version
 docker compose version
 
-# Check you have the project cloned
-ls modules/01-feature-engineering-basics/
+# Verify project structure
+ls feature_repo/
+ls src/pipelines/
 ```
 
-### Exercise 1: Setup and Configuration
+### Exercise 1: Feature Engineering Without a Feature Store
 
-**Goal:** Get the foundation in place for this module.
+**Goal:** Experience the pain points that feature stores solve.
 
-**Step 1:** Review the starter files
-```bash
-ls modules/01-feature-engineering-basics/lab/starter/
+**Step 1:** Create a raw dataset manually.
+
+```python
+# modules/01-feature-engineering-basics/lab/starter/raw_features.py
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
+np.random.seed(42)
+n_users = 100
+n_transactions = 5000
+
+transactions = pd.DataFrame({
+    "user_id": np.random.choice([f"U{i:03d}" for i in range(n_users)], n_transactions),
+    "amount": np.round(np.random.lognormal(3, 1, n_transactions), 2),
+    "timestamp": [datetime.now() - timedelta(hours=np.random.exponential(200))
+                  for _ in range(n_transactions)],
+    "category": np.random.choice(["food", "electronics", "clothing", "travel"], n_transactions),
+})
+
+print(f"Generated {len(transactions)} transactions for {n_users} users")
+print(transactions.head())
 ```
 
-**Step 2:** Set up the required environment
-```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/01-feature-engineering-basics/lab/starter/
+**Step 2:** Compute features manually for training.
+
+```python
+# Feature engineering in a notebook (the "old way")
+from datetime import datetime, timedelta
+
+cutoff = datetime.now() - timedelta(days=30)
+recent = transactions[transactions["timestamp"] >= cutoff]
+
+training_features = recent.groupby("user_id").agg(
+    txn_count_30d=("amount", "count"),
+    avg_amount_30d=("amount", "mean"),
+    max_amount_30d=("amount", "max"),
+    unique_categories=("category", "nunique"),
+).reset_index()
+
+print(f"Training features shape: {training_features.shape}")
+print(training_features.head())
 ```
 
-**Step 3:** Verify the setup
-```bash
-# Run the validation to check your setup
-bash modules/01-feature-engineering-basics/validation/validate.sh
+**Step 3:** Now imagine you need to serve these same features in an API. Write a different version.
+
+```python
+# Simulating a "serving" implementation (different code, same intent)
+import sqlite3
+
+def get_user_features_for_serving(user_id: str) -> dict:
+    """This function has DIFFERENT logic than the training code above."""
+    conn = sqlite3.connect(":memory:")
+    # ... completely different implementation
+    # This is where training-serving skew comes from
+    pass
 ```
 
-**What you should see:** The validation script will show PASS for setup-related checks.
+**Notice the problem?** Two different implementations for the same features.
 
-### Exercise 2: Core Implementation
+### Exercise 2: Understanding Online vs. Offline Access Patterns
 
-**Goal:** Implement the main concept of this module.
+**Goal:** Understand when you need each store type.
 
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
+```python
+# modules/01-feature-engineering-basics/lab/starter/access_patterns.py
+"""
+Scenario: E-commerce fraud detection system
 
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
+For each scenario below, decide: Online store or Offline store?
 
-### Exercise 3: Integration and Testing
+1. A data scientist needs 6 months of user features to train a new model.
+   Answer: OFFLINE -- batch retrieval, point-in-time correctness needed.
 
-**Goal:** Connect this module's work with the broader system.
+2. The fraud API needs a user's avg_spend to score a transaction in <10ms.
+   Answer: ONLINE -- single key lookup, low latency required.
 
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
+3. A weekly report needs feature distributions for model monitoring.
+   Answer: OFFLINE -- batch scan, latency not critical.
+
+4. A recommendation model needs product features during page load.
+   Answer: ONLINE -- per-request lookup, <50ms budget.
+"""
+
+# Simulate the performance difference
+import time
+
+# Offline pattern: scan + aggregate (slow, but powerful)
+def offline_query(data, user_id):
+    """Simulates an offline store query -- full table scan with joins."""
+    start = time.time()
+    result = data[data["user_id"] == user_id].agg({
+        "amount": ["count", "mean", "max"],
+        "category": "nunique",
+    })
+    elapsed = time.time() - start
+    print(f"Offline query: {elapsed*1000:.1f}ms")
+    return result
+
+# Online pattern: key lookup (fast, pre-computed)
+def online_query(cache, user_id):
+    """Simulates an online store query -- direct key lookup."""
+    start = time.time()
+    result = cache.get(user_id, {})
+    elapsed = time.time() - start
+    print(f"Online query: {elapsed*1000:.4f}ms")
+    return result
+```
+
+### Exercise 3: Map the Feature Store Architecture
+
+**Goal:** Draw the architecture for your lab's feature store.
+
+Create a text diagram (or use a tool like draw.io) that shows:
+
+1. Where raw data comes from (PostgreSQL transactions table)
+2. How features are computed (Python feature pipeline)
+3. Where features are stored offline (PostgreSQL / Parquet)
+4. Where features are stored online (Redis)
+5. How models consume features (FastAPI feature server)
+6. Where metadata lives (Feast registry)
+
+```
+Your architecture should look something like:
+
+   [PostgreSQL: raw transactions]
+            |
+            v
+   [Feature Pipeline (Python)]
+            |
+     +------+------+
+     |             |
+     v             v
+ [Parquet]    [Redis]
+ (offline)    (online)
+     |             |
+     v             v
+ [Training]   [FastAPI Server]
+ (batch)      (real-time)
+```
 
 ---
 
 ## Starter Files
 
 Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
+- `raw_features.py` -- Skeleton for manual feature engineering
+- `access_patterns.py` -- Online vs. offline exercise
 
 ## Solution Files
 
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
+Check `lab/solution/` for:
+- Complete implementations with comments
+- Expected output for each exercise
 
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
+> **Important:** Try the exercises yourself first. The learning happens when you struggle with the trade-offs.
 
 ---
 
@@ -129,57 +289,46 @@ If you get stuck, `lab/solution/` contains:
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
+| Computing features differently for training vs. serving | Model accuracy drops in production | Use a feature store to serve the same values everywhere |
+| Storing features without timestamps | Cannot do point-in-time joins | Always include `event_timestamp` in feature data |
+| Using the online store for training data generation | Slow, incomplete data | Use the offline store for batch/historical queries |
+| Ignoring feature freshness | Model uses stale data | Set appropriate TTLs and materialization schedules |
 
 ---
 
 ## Self-Check Questions
 
-Test your understanding before moving on:
-
-1. What is the main purpose of Feature Engineering Basics?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
+1. What is training-serving skew and why is it dangerous?
+2. Name three benefits of using a feature store over ad-hoc feature computation.
+3. When would you use the offline store vs. the online store?
+4. What is an "entity" in feature store terminology?
+5. Why does materialization exist -- why not just read from the offline store at serving time?
 
 ---
 
 ## You Know You Have Completed This Module When...
 
-- [ ] All exercises completed
+- [ ] You can explain the training-serving skew problem to a colleague
+- [ ] You understand the difference between online and offline stores
+- [ ] You can list the core components of a feature store (entity, feature view, registry, etc.)
+- [ ] You completed all three exercises
 - [ ] Validation script passes: `bash modules/01-feature-engineering-basics/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
-- [ ] Self-check questions answered confidently
 
 ---
 
 ## Troubleshooting
 
-### Common Issues
-
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
+**Issue: Python version too old**
 ```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
+python --version  # Need 3.10+
+# Install with pyenv or download from python.org
 ```
 
-**Issue: Permission denied**
+**Issue: Cannot import pandas/numpy**
 ```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
+pip install -r requirements.txt
 ```
 
 ---
 
-**Next: [Module 02 →](../02-feast-setup/)**
+**Next: [Module 02 - Feast Setup and Configuration -->](../02-feast-setup/)**

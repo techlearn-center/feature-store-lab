@@ -1,0 +1,32 @@
+# Feature Store Lab - Python Dependencies
+
+# Feature Store Framework
+feast[redis,postgres]==0.38.0
+
+# Data Processing
+pandas>=2.0.0,<3.0.0
+numpy>=1.24.0,<2.0.0
+
+# Machine Learning
+scikit-learn>=1.3.0,<2.0.0
+
+# Online Store (Redis)
+redis>=5.0.0,<6.0.0
+
+# Offline Store (PostgreSQL)
+psycopg2-binary>=2.9.0,<3.0.0
+
+# Feature Serving API
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.27.0,<1.0.0
+
+# Data Quality
+great-expectations>=0.18.0,<1.0.0
+
+# Configuration
+python-dotenv>=1.0.0,<2.0.0
+
+# Utilities
+pyarrow>=14.0.0
+requests>=2.31.0
+pyyaml>=6.0

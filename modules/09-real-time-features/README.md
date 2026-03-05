@@ -1,4 +1,4 @@
-# Module 09: Real-Time Feature Computation
+# Module 09: On-Demand Features -- Real-Time Computed Features
 
 | | |
 |---|---|
@@ -12,116 +12,308 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of Real-Time Feature Computation
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Explain when on-demand features are needed vs. pre-computed features
+- Define on-demand feature views in Feast
+- Combine stored features with request-time data
+- Use push sources for streaming feature updates
+- Benchmark on-demand feature computation latency
 
 ---
 
 ## Concepts
 
-### What is Real-Time Feature Computation?
+### Pre-Computed vs. On-Demand Features
 
-Real-Time Feature Computation is a fundamental component of Feature Store Lab: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
+| Aspect | Pre-Computed | On-Demand |
+|---|---|---|
+| **When computed** | During pipeline (batch) | At request time (real-time) |
+| **Storage** | Stored in online/offline store | Not stored, computed per request |
+| **Latency** | Fast lookup (sub-ms) | Compute time added (1-10ms) |
+| **Use case** | Features that don't change with context | Features that depend on the current request |
+| **Example** | Customer avg spend over 30 days | Z-score of current transaction vs. customer avg |
 
-**Real-world analogy:** Think of Real-Time Feature Computation like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
+### Why On-Demand Features?
 
-### Why Does This Matter?
+Some features **cannot be pre-computed** because they depend on information only available at inference time.
 
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+```
+Pre-computed (stored in Redis):
+  - avg_transaction_amount_30d = $45.00    (does not change per request)
+  - total_transactions_30d = 23            (does not change per request)
 
-### Key Terminology
+On-demand (computed at inference time):
+  - transaction_amount_zscore              (depends on current transaction!)
+    = (current_amount - avg_amount) / std_amount
+    = ($500 - $45) / $30 = 15.17    <-- this changes every request
 
-| Term | Definition |
-|---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+  - is_high_value_transaction              (depends on current transaction!)
+    = 1 if current_amount > avg + 2*std else 0
+```
+
+### On-Demand Feature View Architecture
+
+```
+Inference Request
+  {customer_id: "C001", amount: 500.00, category: "electronics"}
+         |
+         v
+  +-------------------+
+  | Feature Server    |
+  |                   |
+  | 1. Fetch stored   |<---- Redis: avg_amount=45, std_amount=30
+  |    features       |
+  |                   |
+  | 2. Combine with   |<---- Request: amount=500, category=electronics
+  |    request data   |
+  |                   |
+  | 3. Compute        |----> zscore = (500-45)/30 = 15.17
+  |    on-demand      |----> is_high_value = 1
+  |    features       |----> ratio = 500/45 = 11.11
+  |                   |
+  | 4. Return all     |----> {avg_amount: 45, zscore: 15.17, ...}
+  +-------------------+
+```
 
 ---
 
 ## Hands-On Lab
 
-### Prerequisites Check
+### Exercise 1: Define an On-Demand Feature View
 
-Before starting, verify your environment:
+**Goal:** Create on-demand features that combine stored data with request-time data.
 
-```bash
-# Check Docker is running
-docker --version
-docker compose version
+```python
+# modules/09-real-time-features/lab/starter/on_demand_features.py
+import pandas as pd
+from feast import Field, RequestSource
+from feast.on_demand_feature_view import on_demand_feature_view
+from feast.types import Float64, Int64, String
 
-# Check you have the project cloned
-ls modules/09-real-time-features/
+# Request source: data the caller provides at inference time
+transaction_request = RequestSource(
+    name="transaction_request",
+    schema=[
+        Field(name="transaction_amount", dtype=Float64),
+        Field(name="merchant_category", dtype=String),
+    ],
+)
+
+# On-demand feature view: combines stored + request-time data
+@on_demand_feature_view(
+    sources=[
+        customer_transaction_features,  # From the online store
+        transaction_request,             # From the API request
+    ],
+    schema=[
+        Field(name="transaction_amount_zscore", dtype=Float64),
+        Field(name="is_high_value_transaction", dtype=Int64),
+        Field(name="amount_to_avg_ratio", dtype=Float64),
+        Field(name="is_above_spend_pattern", dtype=Int64),
+    ],
+)
+def transaction_risk_features(inputs: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute real-time risk signals from the transaction context.
+
+    inputs DataFrame contains columns from BOTH sources:
+      - From online store: avg_transaction_amount_30d, std_transaction_amount_30d, ...
+      - From request: transaction_amount, merchant_category
+    """
+    df = pd.DataFrame()
+
+    avg = inputs["avg_transaction_amount_30d"]
+    std = inputs["std_transaction_amount_30d"].clip(lower=1.0)
+    amount = inputs["transaction_amount"]
+
+    # Z-score: how unusual is this transaction for this customer?
+    df["transaction_amount_zscore"] = (amount - avg) / std
+
+    # High value flag: is this above the customer's 95th percentile?
+    threshold = avg + 2 * std
+    df["is_high_value_transaction"] = (amount > threshold).astype(int)
+
+    # Ratio to average: how many times the customer's average?
+    df["amount_to_avg_ratio"] = amount / avg.clip(lower=0.01)
+
+    # Above historical max?
+    df["is_above_spend_pattern"] = (
+        amount > inputs["max_transaction_amount_30d"]
+    ).astype(int)
+
+    return df
 ```
 
-### Exercise 1: Setup and Configuration
+### Exercise 2: Fetch On-Demand Features via the Online Store
 
-**Goal:** Get the foundation in place for this module.
+**Goal:** Retrieve on-demand features alongside stored features.
 
-**Step 1:** Review the starter files
-```bash
-ls modules/09-real-time-features/lab/starter/
+```python
+# modules/09-real-time-features/lab/starter/fetch_on_demand.py
+from feast import FeatureStore
+
+store = FeatureStore(repo_path="feature_repo")
+
+# The entity row includes BOTH the entity key AND the request-time data
+entity_rows = [
+    {
+        "customer_id": "C00001",
+        "transaction_amount": 500.00,      # Request-time
+        "merchant_category": "electronics", # Request-time
+    }
+]
+
+# Feast automatically:
+# 1. Fetches stored features from Redis (avg, std, max, etc.)
+# 2. Passes request-time data to the on-demand transform
+# 3. Returns all features together
+result = store.get_online_features(
+    features=[
+        # Stored features (from Redis)
+        "customer_transaction_features:avg_transaction_amount_30d",
+        "customer_transaction_features:std_transaction_amount_30d",
+        "customer_transaction_features:max_transaction_amount_30d",
+        "customer_transaction_features:total_transactions_30d",
+        # On-demand features (computed now)
+        "transaction_risk_features:transaction_amount_zscore",
+        "transaction_risk_features:is_high_value_transaction",
+        "transaction_risk_features:amount_to_avg_ratio",
+        "transaction_risk_features:is_above_spend_pattern",
+    ],
+    entity_rows=entity_rows,
+).to_dict()
+
+print("=== Feature Results ===")
+for key, values in result.items():
+    print(f"  {key}: {values[0]}")
+
+# Example output:
+# customer_id: C00001
+# avg_transaction_amount_30d: 45.50
+# std_transaction_amount_30d: 30.20
+# max_transaction_amount_30d: 250.00
+# total_transactions_30d: 23
+# transaction_amount_zscore: 15.05    <-- computed on-demand
+# is_high_value_transaction: 1        <-- computed on-demand
+# amount_to_avg_ratio: 10.99          <-- computed on-demand
+# is_above_spend_pattern: 1           <-- computed on-demand
 ```
 
-**Step 2:** Set up the required environment
-```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/09-real-time-features/lab/starter/
+### Exercise 3: Use Push Sources for Streaming Updates
+
+**Goal:** Push real-time data into the feature store from a streaming source.
+
+```python
+# modules/09-real-time-features/lab/starter/push_features.py
+"""
+Push sources allow you to write features to both the online and offline
+store from a streaming pipeline (e.g., Kafka consumer, Flink job).
+"""
+import pandas as pd
+from datetime import datetime
+from feast import FeatureStore
+
+store = FeatureStore(repo_path="feature_repo")
+
+# Simulate a real-time event arriving from a stream processor
+event_df = pd.DataFrame({
+    "customer_id": ["C00001"],
+    "total_transactions_30d": [24],       # Updated count
+    "total_spend_30d": [1550.00],         # Updated spend
+    "avg_transaction_amount_30d": [64.58], # Updated average
+    "max_transaction_amount_30d": [500.0], # Updated max
+    "min_transaction_amount_30d": [5.0],
+    "std_transaction_amount_30d": [95.0],
+    "unique_merchants_30d": [8],
+    "days_since_last_transaction": [0],    # Just transacted
+    "transaction_frequency_7d": [4.0],
+    "spend_trend_7d_vs_30d": [0.35],
+    "event_timestamp": [datetime.now()],
+    "created_timestamp": [datetime.now()],
+})
+
+# Push to online store (for real-time serving)
+store.push("customer_activity_push", event_df, to=PushMode.ONLINE)
+print("Pushed to online store")
+
+# Push to both online and offline (for consistency)
+store.push("customer_activity_push", event_df, to=PushMode.ONLINE_AND_OFFLINE)
+print("Pushed to online and offline stores")
 ```
 
-**Step 3:** Verify the setup
-```bash
-# Run the validation to check your setup
-bash modules/09-real-time-features/validation/validate.sh
+### Exercise 4: Benchmark On-Demand Feature Latency
+
+**Goal:** Measure how much latency on-demand computation adds.
+
+```python
+# modules/09-real-time-features/lab/starter/on_demand_benchmark.py
+import time
+import statistics
+from feast import FeatureStore
+
+store = FeatureStore(repo_path="feature_repo")
+
+stored_only = [
+    "customer_transaction_features:total_transactions_30d",
+    "customer_transaction_features:avg_transaction_amount_30d",
+    "customer_transaction_features:std_transaction_amount_30d",
+]
+
+with_on_demand = stored_only + [
+    "transaction_risk_features:transaction_amount_zscore",
+    "transaction_risk_features:is_high_value_transaction",
+    "transaction_risk_features:amount_to_avg_ratio",
+]
+
+entity_row_stored = [{"customer_id": "C00001"}]
+entity_row_on_demand = [{
+    "customer_id": "C00001",
+    "transaction_amount": 500.0,
+    "merchant_category": "electronics",
+}]
+
+# Warm up
+for _ in range(5):
+    store.get_online_features(features=stored_only, entity_rows=entity_row_stored)
+    store.get_online_features(features=with_on_demand, entity_rows=entity_row_on_demand)
+
+# Benchmark stored-only
+stored_latencies = []
+for _ in range(100):
+    start = time.time()
+    store.get_online_features(features=stored_only, entity_rows=entity_row_stored)
+    stored_latencies.append((time.time() - start) * 1000)
+
+# Benchmark with on-demand
+od_latencies = []
+for _ in range(100):
+    start = time.time()
+    store.get_online_features(features=with_on_demand, entity_rows=entity_row_on_demand)
+    od_latencies.append((time.time() - start) * 1000)
+
+print("=== Stored Features Only ===")
+print(f"  p50: {statistics.median(stored_latencies):.2f}ms")
+print(f"  p95: {sorted(stored_latencies)[94]:.2f}ms")
+
+print("\n=== With On-Demand Features ===")
+print(f"  p50: {statistics.median(od_latencies):.2f}ms")
+print(f"  p95: {sorted(od_latencies)[94]:.2f}ms")
+
+overhead = statistics.median(od_latencies) - statistics.median(stored_latencies)
+print(f"\n  On-demand overhead (p50): {overhead:.2f}ms")
 ```
-
-**What you should see:** The validation script will show PASS for setup-related checks.
-
-### Exercise 2: Core Implementation
-
-**Goal:** Implement the main concept of this module.
-
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
-
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
-
-### Exercise 3: Integration and Testing
-
-**Goal:** Connect this module's work with the broader system.
-
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
 
 ---
 
-## Starter Files
+## When to Use On-Demand vs. Pre-Computed Features
 
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
-
-## Solution Files
-
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
-
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
+| Scenario | Approach | Reason |
+|---|---|---|
+| Customer's average spend over 30 days | Pre-computed | Does not change per request |
+| Z-score of current transaction amount | On-demand | Depends on current amount |
+| Product's average rating | Pre-computed | Slowly changing |
+| Time since customer's last login | On-demand | Changes every second |
+| User-item affinity score | Pre-computed | Can be batched |
+| Price difference from competitor | On-demand | External data at request time |
 
 ---
 
@@ -129,57 +321,48 @@ If you get stuck, `lab/solution/` contains:
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
+| Heavy computation in on-demand views | High serving latency | Move complex logic to batch pipeline |
+| Missing request source fields in entity_rows | `KeyError` at inference | Include all RequestSource fields in entity_rows |
+| Using on-demand for features that could be pre-computed | Unnecessary latency | Pre-compute anything that does not depend on request context |
+| Not testing on-demand views with edge cases | NaN or infinity in results | Test with zero, negative, and extreme values |
 
 ---
 
 ## Self-Check Questions
 
-Test your understanding before moving on:
-
-1. What is the main purpose of Real-Time Feature Computation?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
+1. What makes a feature on-demand vs. pre-computable?
+2. How does an on-demand feature view get its input data?
+3. What is a RequestSource and when do you need one?
+4. What is the latency trade-off of on-demand features?
+5. How do push sources differ from batch materialization?
 
 ---
 
 ## You Know You Have Completed This Module When...
 
-- [ ] All exercises completed
+- [ ] You have defined an on-demand feature view with request-time inputs
+- [ ] You can fetch on-demand features via `get_online_features()`
+- [ ] You understand push sources for streaming updates
+- [ ] You have benchmarked the latency overhead of on-demand computation
 - [ ] Validation script passes: `bash modules/09-real-time-features/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
-- [ ] Self-check questions answered confidently
 
 ---
 
 ## Troubleshooting
 
-### Common Issues
-
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
-```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
+**Issue: On-demand feature returns NaN**
+```python
+# Check for division by zero in your transform
+# Use .clip(lower=1.0) on denominators
+# Test with: inputs["std_transaction_amount_30d"] = 0
 ```
 
-**Issue: Permission denied**
-```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
+**Issue: KeyError for request source field**
+```python
+# Ensure your entity_rows include ALL fields from the RequestSource
+# Check: transaction_amount AND merchant_category must be present
 ```
 
 ---
 
-**Next: [Module 10 →](../10-production-feature-store/)**
+**Next: [Module 10 - Production Deployment -->](../10-production-feature-store/)**

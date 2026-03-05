@@ -1,10 +1,10 @@
-# Module 06: Feature Transformation Pipelines
+# Module 06: Feature Pipelines -- Materialization, Scheduling, and Orchestration
 
 | | |
 |---|---|
 | **Time** | 3-5 hours |
 | **Difficulty** | Intermediate |
-| **Prerequisites** | Module 05 completed |
+| **Prerequisites** | Module 05 completed, features materialized |
 
 ---
 
@@ -12,116 +12,343 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of Feature Transformation Pipelines
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Build end-to-end feature engineering pipelines
+- Understand materialization strategies (full vs. incremental)
+- Schedule feature pipelines for automated execution
+- Handle late-arriving data and backfills
+- Monitor pipeline health and freshness
 
 ---
 
 ## Concepts
 
-### What is Feature Transformation Pipelines?
+### What Is a Feature Pipeline?
 
-Feature Transformation Pipelines is a fundamental component of Feature Store Lab: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
+A feature pipeline is an automated workflow that:
+1. **Reads** raw data from source systems (databases, event streams, files)
+2. **Transforms** raw data into ML features (aggregations, ratios, encodings)
+3. **Writes** features to the offline store (for training data generation)
+4. **Materializes** features to the online store (for real-time serving)
 
-**Real-world analogy:** Think of Feature Transformation Pipelines like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
+```
++----------+     +-----------+     +-------------+     +--------------+
+|  Raw     | --> | Transform | --> | Write to    | --> | Materialize  |
+|  Data    |     | & Compute |     | Offline     |     | to Online    |
+|  Sources |     | Features  |     | Store       |     | Store        |
++----------+     +-----------+     +-------------+     +--------------+
+     ^                                                        |
+     |                                                        v
+  Scheduled                                             Redis (serving)
+  (cron / Airflow / Prefect)
+```
 
-### Why Does This Matter?
+### Materialization Strategies
 
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+| Strategy | How It Works | When to Use |
+|---|---|---|
+| **Full** | Recomputes all features from scratch | Initial load, schema changes, backfills |
+| **Incremental** | Only processes new data since last run | Daily/hourly updates, cost efficiency |
+| **feast materialize** | Pushes latest offline values to online store | After offline store is updated |
+| **feast materialize-incremental** | Only materializes new data | Regular scheduled updates |
 
-### Key Terminology
+```bash
+# Full materialization (specify explicit time range)
+feast materialize 2024-01-01T00:00:00 2024-12-31T23:59:59
 
-| Term | Definition |
-|---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+# Incremental materialization (from last checkpoint)
+feast materialize-incremental $(date -u +%Y-%m-%dT%H:%M:%S)
+```
+
+### Pipeline Architecture
+
+```
+                    Feature Pipeline Architecture
+
+  +------------------+     +------------------+     +------------------+
+  | Stage 1:         |     | Stage 2:         |     | Stage 3:         |
+  | Data Ingestion   |     | Feature Compute  |     | Store & Serve    |
+  |                  |     |                  |     |                  |
+  | - Read from DB   |     | - Aggregations   |     | - Write Parquet  |
+  | - Read from S3   | --> | - Window funcs   | --> | - Materialize    |
+  | - Read streams   |     | - Joins          |     | - Validate       |
+  | - Validate raw   |     | - Encode cats    |     | - Alert on fail  |
+  +------------------+     +------------------+     +------------------+
+         |                        |                        |
+         v                        v                        v
+    [Data Quality]         [Feature Quality]         [Freshness Check]
+```
 
 ---
 
 ## Hands-On Lab
 
-### Prerequisites Check
+### Exercise 1: Run the Feature Pipeline End-to-End
 
-Before starting, verify your environment:
+**Goal:** Execute the full feature pipeline from data generation to materialization.
 
 ```bash
-# Check Docker is running
-docker --version
-docker compose version
+# Run all stages sequentially
+python -m src.pipelines.feature_pipeline --stage all
 
-# Check you have the project cloned
-ls modules/06-feature-pipelines/
+# Or run stages individually:
+
+# Stage 1: Generate synthetic raw data
+python -m src.pipelines.feature_pipeline --stage generate
+
+# Stage 2: Compute features from raw data
+python -m src.pipelines.feature_pipeline --stage compute
+
+# Stage 3: Materialize to online store
+python -m src.pipelines.feature_pipeline --stage materialize
 ```
 
-### Exercise 1: Setup and Configuration
+```python
+# Verify the pipeline output
+import pandas as pd
 
-**Goal:** Get the foundation in place for this module.
+# Check offline store data
+customers = pd.read_parquet("data/processed/customer_transactions.parquet")
+products = pd.read_parquet("data/processed/product_features.parquet")
 
-**Step 1:** Review the starter files
-```bash
-ls modules/06-feature-pipelines/lab/starter/
+print(f"Customer features: {customers.shape} ({customers['customer_id'].nunique()} unique)")
+print(f"Product features: {products.shape} ({products['product_id'].nunique()} unique)")
+print(f"\nCustomer feature columns: {customers.columns.tolist()}")
+print(f"\nSample customer features:")
+print(customers.head())
 ```
 
-**Step 2:** Set up the required environment
-```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/06-feature-pipelines/lab/starter/
+### Exercise 2: Build an Incremental Pipeline
+
+**Goal:** Create a pipeline that only processes new data.
+
+```python
+# modules/06-feature-pipelines/lab/starter/incremental_pipeline.py
+import pandas as pd
+import os
+from datetime import datetime
+
+CHECKPOINT_FILE = "data/.pipeline_checkpoint"
+
+def get_last_checkpoint() -> datetime:
+    """Read the last successful pipeline run timestamp."""
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, "r") as f:
+            return datetime.fromisoformat(f.read().strip())
+    return datetime.min
+
+def save_checkpoint(ts: datetime) -> None:
+    """Save the current pipeline run timestamp."""
+    os.makedirs(os.path.dirname(CHECKPOINT_FILE), exist_ok=True)
+    with open(CHECKPOINT_FILE, "w") as f:
+        f.write(ts.isoformat())
+
+def run_incremental_pipeline():
+    last_run = get_last_checkpoint()
+    current_run = datetime.now()
+    print(f"Processing data from {last_run} to {current_run}")
+
+    # Read only new raw data since last checkpoint
+    transactions = pd.read_parquet("data/raw/transactions.parquet")
+    new_data = transactions[transactions["timestamp"] > last_run]
+
+    if len(new_data) == 0:
+        print("No new data to process. Skipping.")
+        return
+
+    print(f"Found {len(new_data)} new transactions to process")
+
+    # Compute features for affected entities only
+    affected_customers = new_data["customer_id"].unique()
+    print(f"Recomputing features for {len(affected_customers)} customers")
+
+    # ... (recompute features for affected customers)
+
+    save_checkpoint(current_run)
+    print(f"Checkpoint saved: {current_run}")
+
+if __name__ == "__main__":
+    run_incremental_pipeline()
 ```
 
-**Step 3:** Verify the setup
-```bash
-# Run the validation to check your setup
-bash modules/06-feature-pipelines/validation/validate.sh
+### Exercise 3: Schedule Pipeline Execution
+
+**Goal:** Set up automated scheduling for the feature pipeline.
+
+```python
+# modules/06-feature-pipelines/lab/starter/scheduled_pipeline.py
+"""
+Option 1: Simple cron-based scheduling (Linux/Mac)
+Add to crontab: crontab -e
+
+# Run feature pipeline every hour
+0 * * * * cd /path/to/feature-store-lab && python -m src.pipelines.feature_pipeline --stage all >> /var/log/feature_pipeline.log 2>&1
+
+# Run materialization every 15 minutes
+*/15 * * * * cd /path/to/feature-store-lab && python -m src.pipelines.feature_pipeline --stage materialize >> /var/log/materialization.log 2>&1
+"""
+
+"""
+Option 2: Python-based scheduler using APScheduler
+"""
+from apscheduler.schedulers.blocking import BlockingScheduler
+from src.pipelines.feature_pipeline import (
+    generate_raw_data,
+    compute_customer_features,
+    compute_product_features,
+    write_features_to_store,
+    materialize_features,
+)
+
+scheduler = BlockingScheduler()
+
+@scheduler.scheduled_job("interval", hours=1, id="feature_compute")
+def hourly_feature_compute():
+    """Recompute features from raw data every hour."""
+    customer_features = compute_customer_features()
+    product_features = compute_product_features()
+    write_features_to_store(customer_features, product_features)
+    print("Feature computation complete")
+
+@scheduler.scheduled_job("interval", minutes=15, id="materialize")
+def frequent_materialize():
+    """Push latest features to online store every 15 minutes."""
+    materialize_features(days_back=1)
+    print("Materialization complete")
+
+if __name__ == "__main__":
+    print("Starting feature pipeline scheduler...")
+    scheduler.start()
 ```
 
-**What you should see:** The validation script will show PASS for setup-related checks.
+```python
+"""
+Option 3: Airflow DAG (production-grade)
+"""
+# dags/feature_pipeline_dag.py
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
 
-### Exercise 2: Core Implementation
+default_args = {
+    "owner": "ml-platform",
+    "depends_on_past": False,
+    "retries": 2,
+    "retry_delay": timedelta(minutes=5),
+}
 
-**Goal:** Implement the main concept of this module.
+with DAG(
+    "feature_pipeline",
+    default_args=default_args,
+    schedule_interval="0 * * * *",  # Every hour
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    tags=["feature-store", "ml"],
+) as dag:
 
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
+    generate = PythonOperator(
+        task_id="generate_raw_data",
+        python_callable=generate_raw_data,
+    )
 
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
+    compute = PythonOperator(
+        task_id="compute_features",
+        python_callable=lambda: write_features_to_store(
+            compute_customer_features(), compute_product_features()
+        ),
+    )
 
-### Exercise 3: Integration and Testing
+    materialize = PythonOperator(
+        task_id="materialize_to_online",
+        python_callable=materialize_features,
+    )
 
-**Goal:** Connect this module's work with the broader system.
+    generate >> compute >> materialize
+```
 
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
+### Exercise 4: Handle Backfills
 
----
+**Goal:** Reprocess historical data when feature logic changes.
 
-## Starter Files
+```python
+# modules/06-feature-pipelines/lab/starter/backfill.py
+from feast import FeatureStore
+from datetime import datetime, timedelta
 
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
+def backfill_features(days_back: int = 90):
+    """
+    Backfill features when:
+    - A new feature is added to an existing view
+    - Feature computation logic changes
+    - Data quality issues are discovered and fixed
+    """
+    store = FeatureStore(repo_path="feature_repo")
 
-## Solution Files
+    end = datetime.now()
+    start = end - timedelta(days=days_back)
 
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
+    print(f"Backfilling features from {start} to {end}")
+    print("This will reprocess ALL feature views for the time range.")
 
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
+    # Step 1: Recompute features (this would run with the new logic)
+    # python -m src.pipelines.feature_pipeline --stage compute
+
+    # Step 2: Full materialization over the backfill window
+    store.materialize(
+        start_date=start,
+        end_date=end,
+    )
+
+    print("Backfill complete!")
+
+if __name__ == "__main__":
+    backfill_features(days_back=90)
+```
+
+### Exercise 5: Monitor Pipeline Freshness
+
+**Goal:** Track when features were last updated and alert on staleness.
+
+```python
+# modules/06-feature-pipelines/lab/starter/freshness_monitor.py
+import pandas as pd
+from datetime import datetime, timedelta
+
+def check_feature_freshness(max_age_hours: int = 2):
+    """Check that features are not stale."""
+    issues = []
+
+    # Check customer features
+    df = pd.read_parquet("data/processed/customer_transactions.parquet")
+    latest = df["event_timestamp"].max()
+    age = datetime.now() - latest
+    age_hours = age.total_seconds() / 3600
+
+    print(f"Customer features - Last updated: {latest} (age: {age_hours:.1f}h)")
+    if age_hours > max_age_hours:
+        issues.append(f"Customer features are {age_hours:.1f}h old (max: {max_age_hours}h)")
+
+    # Check product features
+    df = pd.read_parquet("data/processed/product_features.parquet")
+    latest = df["event_timestamp"].max()
+    age = datetime.now() - latest
+    age_hours = age.total_seconds() / 3600
+
+    print(f"Product features  - Last updated: {latest} (age: {age_hours:.1f}h)")
+    if age_hours > max_age_hours:
+        issues.append(f"Product features are {age_hours:.1f}h old (max: {max_age_hours}h)")
+
+    if issues:
+        print(f"\nSTALE FEATURES DETECTED:")
+        for issue in issues:
+            print(f"  - {issue}")
+        return False
+
+    print("\nAll features are fresh.")
+    return True
+
+if __name__ == "__main__":
+    check_feature_freshness()
+```
 
 ---
 
@@ -129,57 +356,51 @@ If you get stuck, `lab/solution/` contains:
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
+| Running full materialization when incremental suffices | Slow, expensive pipeline runs | Use `materialize-incremental` for regular updates |
+| No checkpoint tracking | Duplicate or missed data processing | Implement checkpoint files or use orchestrator state |
+| No freshness monitoring | Stale features silently degrade model | Set up alerts on feature age |
+| Not handling late-arriving data | Missing features for recent events | Use a buffer window in your processing cutoff |
+| Backfilling without testing | Corrupted features in production | Test backfill on a staging environment first |
 
 ---
 
 ## Self-Check Questions
 
-Test your understanding before moving on:
-
-1. What is the main purpose of Feature Transformation Pipelines?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
+1. What is the difference between `materialize` and `materialize-incremental`?
+2. Why would you need to backfill features?
+3. How would you handle a feature pipeline that fails midway?
+4. What is the trade-off between pipeline frequency and cost?
+5. How would you schedule different feature views at different frequencies?
 
 ---
 
 ## You Know You Have Completed This Module When...
 
-- [ ] All exercises completed
+- [ ] You can run the feature pipeline end-to-end
+- [ ] You understand full vs. incremental materialization
+- [ ] You have built or configured a scheduling mechanism
+- [ ] You have implemented a freshness monitoring check
 - [ ] Validation script passes: `bash modules/06-feature-pipelines/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
-- [ ] Self-check questions answered confidently
 
 ---
 
 ## Troubleshooting
 
-### Common Issues
-
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
+**Issue: Pipeline runs but features are not updated in Redis**
 ```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
+# Check that feast apply was run after any definition changes
+cd feature_repo && feast apply
+# Then re-run materialization
+feast materialize-incremental $(date -u +%Y-%m-%dT%H:%M:%S)
 ```
 
-**Issue: Permission denied**
-```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
+**Issue: Incremental pipeline misses data**
+```python
+# Add a buffer to your checkpoint to catch late-arriving data
+buffer = timedelta(hours=1)
+effective_start = last_checkpoint - buffer
 ```
 
 ---
 
-**Next: [Module 07 →](../07-data-quality/)**
+**Next: [Module 07 - Data Quality -->](../07-data-quality/)**

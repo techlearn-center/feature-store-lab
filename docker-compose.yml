@@ -1,0 +1,117 @@
+version: "3.8"
+
+services:
+  # =============================================================
+  # PostgreSQL - Offline Feature Store
+  # Stores historical feature values for training data generation
+  # =============================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: feast-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-feast_offline}
+      POSTGRES_USER: ${POSTGRES_USER:-feast}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-feast_password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-feast}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - feast-network
+
+  # =============================================================
+  # Redis - Online Feature Store
+  # Serves features with sub-millisecond latency for inference
+  # =============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: feast-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - feast-network
+
+  # =============================================================
+  # Feature Store App - Feast + FastAPI Feature Server
+  # Runs the feature pipeline and serves features via REST API
+  # =============================================================
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: feast-app
+    ports:
+      - "${FEATURE_SERVER_PORT:-8000}:8000"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-feast_offline}
+      POSTGRES_USER: ${POSTGRES_USER:-feast}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-feast_password}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      FEAST_REPO_PATH: /app/feature_repo
+    volumes:
+      - ./data:/app/data
+      - ./feature_repo:/app/feature_repo
+      - ./src:/app/src
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - feast-network
+
+  # =============================================================
+  # Jupyter Notebook - Interactive Development Environment
+  # For exploratory feature engineering and analysis
+  # =============================================================
+  jupyter:
+    image: jupyter/scipy-notebook:latest
+    container_name: feast-jupyter
+    ports:
+      - "${JUPYTER_PORT:-8888}:8888"
+    environment:
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN:-featurestore}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-feast_offline}
+      POSTGRES_USER: ${POSTGRES_USER:-feast}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-feast_password}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./data:/home/jovyan/data
+      - ./feature_repo:/home/jovyan/feature_repo
+      - ./src:/home/jovyan/src
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - feast-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  feast-network:
+    driver: bridge
